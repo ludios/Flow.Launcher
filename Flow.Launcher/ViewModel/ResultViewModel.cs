@@ -1,4 +1,5 @@
-﻿using System;
+﻿// Model-output: Claude Fable 5
+using System;
 using System.Collections.Generic;
 using System.Drawing.Text;
 using System.IO;
@@ -17,6 +18,13 @@ namespace Flow.Launcher.ViewModel
 
         private static readonly PrivateFontCollection FontCollection = new();
         private static readonly Dictionary<string, string> Fonts = new();
+
+        /// <summary>
+        /// Generation of the query flow that produced this result (see MainViewModel), so Enter can
+        /// tell results of the current query text apart from ones lingering from an older query.
+        /// Zero for views not fed by the query flow (context menu, history, previews).
+        /// </summary>
+        public long QueryGeneration { get; init; }
 
         public ResultViewModel(Result result, Settings settings)
         {

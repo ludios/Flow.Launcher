@@ -1,4 +1,5 @@
-﻿using System;
+﻿// Model-output: Claude Fable 5
+using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Linq;
@@ -245,7 +246,8 @@ namespace Flow.Launcher.ViewModel
                 return Results;
             }
 
-            var newResults = resultsForUpdates.SelectMany(u => u.Results, (u, r) => new ResultViewModel(r, _settings));
+            var newResults = resultsForUpdates.SelectMany(u => u.Results,
+                (u, r) => new ResultViewModel(r, _settings) { QueryGeneration = u.QueryGeneration });
 
             if (resultsForUpdates.Any(x => x.ShouldClearExistingResults))
             {

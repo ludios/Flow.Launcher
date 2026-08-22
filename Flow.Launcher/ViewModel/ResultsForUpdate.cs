@@ -1,4 +1,5 @@
-﻿using Flow.Launcher.Plugin;
+﻿// Model-output: Claude Fable 5
+using Flow.Launcher.Plugin;
 using System.Collections.Generic;
 using System.Threading;
 
@@ -10,7 +11,8 @@ namespace Flow.Launcher.ViewModel
         Query Query,
         CancellationToken Token,
         bool ReSelectFirstResult = true,
-        bool ShouldClearExistingResults = false)
+        bool ShouldClearExistingResults = false,
+        long QueryGeneration = 0)
     {
         public string ID { get; } = Metadata.ID;
     }

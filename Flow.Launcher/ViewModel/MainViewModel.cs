@@ -1,4 +1,5 @@
-﻿using System;
+﻿// Model-output: Claude Fable 5
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -40,6 +41,7 @@ namespace Flow.Launcher.ViewModel
         private bool _previousIsHomeQuery;
         private readonly ConcurrentDictionary<Guid, Query> _progressQueryDict = new(); // Used for QueryResultAsync
         private Query _updateQuery; // Used for ResultsUpdated
+        private long _updateQueryGeneration; // Query generation of _updateQuery, stamped onto ResultsUpdated batches
         private string _queryTextBeforeLeaveResults;
         private string _ignoredQueryText; // Used to ignore query text change when switching between context menu and query results
 
@@ -66,11 +68,16 @@ namespace Flow.Launcher.ViewModel
         private readonly record struct ResultsUpdateMessage(ResultsForUpdate? Update, TaskCompletionSource Barrier);
         // Latest query flow task (covers search delay, plugin queries and their writes into the update channel).
         private volatile Task _latestQueryFlowTask = Task.CompletedTask;
+        // Monotonic count of query flow starts. Each flow stamps the result batches it writes with its
+        // generation (flowing into ResultViewModel.QueryGeneration), so when the settle wait fails Enter
+        // can tell results of the current query text apart from ones lingering from an older query.
+        private long _queryGeneration;
         // True from the moment the view-update loop wakes for a batch until that batch is applied.
         // An empty channel plus this flag being false means the view is fully caught up (Enter fast path).
         private volatile bool _viewUpdateInProgress;
-        // Upper bound on how long Enter may wait for in-flight queries before falling back to the current list,
-        // so a slow or hung plugin can never make Enter unresponsive.
+        // Upper bound on how long Enter may wait for in-flight queries, so a slow or hung plugin can
+        // never block Enter indefinitely. After the timeout, Enter opens the selected result only if
+        // it was produced by the latest query flow, and otherwise does nothing.
         private const int OpenResultSettleTimeoutMs = 1000;
 
         private readonly IReadOnlyList<Result> _emptyResult = new List<Result>();
@@ -369,8 +376,11 @@ namespace Flow.Launcher.ViewModel
 
                 App.API.LogDebug(ClassName, $"Update results for plugin <{pair.Metadata.Name}>");
 
+                // The guard above ties this update to _updateQuery, so _updateQuery's generation is
+                // the right stamp (racing with a same-text re-query can at worst stamp a newer
+                // generation, which only makes Enter's staleness check more permissive).
                 if (!TryWriteResultsForUpdate(new ResultsForUpdate(resultsCopy, pair.Metadata, e.Query,
-                    token)))
+                    token, QueryGeneration: Volatile.Read(ref _updateQueryGeneration))))
                 {
                     App.API.LogError(ClassName, "Unable to add item to Result Update Queue");
                 }
@@ -620,7 +630,8 @@ namespace Flow.Launcher.ViewModel
         /// <param name="timeoutMs">Upper bound in milliseconds on the total wait, so a slow or
         /// hung plugin cannot block opening a result indefinitely.</param>
         /// <returns>True if the view settled within the timeout; false on timeout, on a faulted
-        /// view-update loop, or during shutdown. Callers should then act on the current list as-is.</returns>
+        /// view-update loop, or during shutdown. Callers must then treat the list as possibly stale
+        /// and only act on results stamped with the current query generation.</returns>
         private async Task<bool> WaitForResultsSettledAsync(int timeoutMs)
         {
             var deadline = Environment.TickCount64 + timeoutMs;
@@ -708,7 +719,21 @@ namespace Flow.Launcher.ViewModel
                 var settled = await WaitForResultsSettledAsync(OpenResultSettleTimeoutMs);
                 if (!settled)
                 {
-                    App.API.LogDebug(ClassName, "Query did not settle in time; opening currently selected result");
+                    // The list may still contain results from an older query text (plugins that have
+                    // not published a replacement keep their old entries), and opening one of those
+                    // is exactly the stale launch this command exists to prevent. So on a failed
+                    // settle, only open a result stamped by the latest query flow; otherwise do
+                    // nothing and let the user press Enter again once the list catches up.
+                    var selected = Results.SelectedItem;
+                    if (selected?.Result == null ||
+                        selected.QueryGeneration != Interlocked.Read(ref _queryGeneration))
+                    {
+                        App.API.LogDebug(ClassName,
+                            "Query did not settle in time and the selected result is from an older query; ignoring open request");
+                        return;
+                    }
+                    App.API.LogDebug(ClassName,
+                        "Query did not settle in time; opening selected result from the current query");
                 }
             }
             await OpenResultCoreAsync(null, specialKeyState);
@@ -1722,12 +1747,15 @@ namespace Flow.Launcher.ViewModel
         /// <returns>The task representing the whole query flow, including channel writes.</returns>
         private Task QueryResultsAsync(bool searchDelay, bool isReQuery = false, bool reSelect = true)
         {
-            var task = QueryResultsCoreAsync(searchDelay, isReQuery, reSelect);
+            // Incremented before the core starts so every batch this flow writes carries the new
+            // generation, and any result still stamped with an older one is stale by definition.
+            var queryGeneration = Interlocked.Increment(ref _queryGeneration);
+            var task = QueryResultsCoreAsync(searchDelay, isReQuery, reSelect, queryGeneration);
             _latestQueryFlowTask = task;
             return task;
         }
 
-        private async Task QueryResultsCoreAsync(bool searchDelay, bool isReQuery, bool reSelect)
+        private async Task QueryResultsCoreAsync(bool searchDelay, bool isReQuery, bool reSelect, long queryGeneration)
         {
             _updateSource?.Cancel();
 
@@ -1769,6 +1797,7 @@ namespace Flow.Launcher.ViewModel
 
                 _progressQueryDict.TryAdd(updateGuid, query);
                 _updateQuery = query;
+                Volatile.Write(ref _updateQueryGeneration, queryGeneration);
 
                 // Switch to ThreadPool thread
                 await TaskScheduler.Default;
@@ -1960,7 +1989,7 @@ namespace Flow.Launcher.ViewModel
                 App.API.LogDebug(ClassName, $"Update results for plugin <{plugin.Metadata.Name}>");
 
                 if (!TryWriteResultsForUpdate(new ResultsForUpdate(resultsCopy, plugin.Metadata, query,
-                    token, reSelect)))
+                    token, reSelect, QueryGeneration: queryGeneration)))
                 {
                     App.API.LogError(ClassName, "Unable to add item to Result Update Queue");
                 }
@@ -1976,7 +2005,7 @@ namespace Flow.Launcher.ViewModel
                 App.API.LogDebug(ClassName, $"Update results for history");
 
                 if (!TryWriteResultsForUpdate(new ResultsForUpdate(results, _historyMetadata, query,
-                    token, reSelect)))
+                    token, reSelect, QueryGeneration: queryGeneration)))
                 {
                     App.API.LogError(ClassName, "Unable to add item to Result Update Queue");
                 }
