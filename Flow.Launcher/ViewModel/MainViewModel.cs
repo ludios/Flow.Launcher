@@ -55,21 +55,20 @@ namespace Flow.Launcher.ViewModel
         private CancellationTokenSource _updateSource; // Used to cancel old query flows
         private CancellationToken _updateToken; // Used to avoid ObjectDisposedException of _updateSource.Token
 
-        private ChannelWriter<ResultsForUpdate> _resultsUpdateChannelWriter;
+        private ChannelWriter<ResultsUpdateMessage> _resultsUpdateChannelWriter;
+        private ChannelReader<ResultsUpdateMessage> _resultsUpdateChannelReader;
         private Task _resultsViewUpdateTask;
 
         // ---- State for making Enter wait until the result list has caught up with the query text ----
+        // A batch of plugin results for the view, or (when Update is null) a barrier: because the
+        // channel is FIFO, the view-update loop resolves Barrier only after every batch written
+        // before it has been applied to the result list.
+        private readonly record struct ResultsUpdateMessage(ResultsForUpdate? Update, TaskCompletionSource Barrier);
         // Latest query flow task (covers search delay, plugin queries and their writes into the update channel).
         private volatile Task _latestQueryFlowTask = Task.CompletedTask;
-        // Count of ResultsForUpdate batches written into the update channel. Incremented under
-        // _resultsWriteLock together with the channel write, so channel order == counter order.
-        private long _resultsWrittenCount;
-        // Count of batches the view-update loop has drained from the channel and applied (or skipped as cancelled).
-        // Invariant: _resultsProcessedCount <= _resultsWrittenCount; equality means the view is caught up.
-        private long _resultsProcessedCount;
-        private readonly object _resultsWriteLock = new();
-        // Completed and swapped by the view-update loop after every applied batch; waiters re-check the counters.
-        private TaskCompletionSource _resultsProcessedSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        // True from the moment the view-update loop wakes for a batch until that batch is applied.
+        // An empty channel plus this flag being false means the view is fully caught up (Enter fast path).
+        private volatile bool _viewUpdateInProgress;
         // Upper bound on how long Enter may wait for in-flight queries before falling back to the current list,
         // so a slow or hung plugin can never make Enter unresponsive.
         private const int OpenResultSettleTimeoutMs = 1000;
@@ -225,8 +224,9 @@ namespace Flow.Launcher.ViewModel
 
         private void RegisterViewUpdate()
         {
-            var resultUpdateChannel = Channel.CreateUnbounded<ResultsForUpdate>();
+            var resultUpdateChannel = Channel.CreateUnbounded<ResultsUpdateMessage>();
             _resultsUpdateChannelWriter = resultUpdateChannel.Writer;
+            _resultsUpdateChannelReader = resultUpdateChannel.Reader;
             _resultsViewUpdateTask =
                 Task.Run(UpdateActionAsync).ContinueWith(continueAction,
                     CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
@@ -234,18 +234,23 @@ namespace Flow.Launcher.ViewModel
             async Task UpdateActionAsync()
             {
                 var queue = new Dictionary<string, ResultsForUpdate>();
+                var barriers = new List<TaskCompletionSource>();
                 var channelReader = resultUpdateChannel.Reader;
-                // Resume from the published count so a restart after a fault does not lose progress
-                var processedCount = Interlocked.Read(ref _resultsProcessedCount);
 
                 // it is not supposed to be false because it won't be complete
                 while (await channelReader.WaitToReadAsync())
                 {
+                    // Set before draining: settle-waiters treat "channel empty and no apply in
+                    // progress" as caught up, so this must cover the drained-but-unapplied window
+                    _viewUpdateInProgress = true;
                     await Task.Delay(20);
-                    while (channelReader.TryRead(out var item))
+                    while (channelReader.TryRead(out var message))
                     {
-                        // Cancelled items count as processed too: they are consumed and will never be applied
-                        processedCount++;
+                        if (message.Update is not { } item)
+                        {
+                            barriers.Add(message.Barrier);
+                            continue;
+                        }
                         if (!item.Token.IsCancellationRequested)
                         {
                             // Indicate if to clear existing results so to show only ones from plugins with action keywords
@@ -269,15 +274,33 @@ namespace Flow.Launcher.ViewModel
                         }
                     }
 
-                    UpdateResultView(queue.Values);
-                    queue.Clear();
-
-                    // Publish progress only after the batch is applied to the view, then wake settle-waiters.
-                    // Order matters: waiters capture the signal task, re-check the counter, then await,
-                    // so publishing the count first makes a missed wake-up impossible.
-                    Interlocked.Exchange(ref _resultsProcessedCount, processedCount);
-                    Interlocked.Exchange(ref _resultsProcessedSignal,
-                        new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
+                    try
+                    {
+                        UpdateResultView(queue.Values);
+                        queue.Clear();
+                        // Resolve barriers only after the batch is applied: FIFO order of the
+                        // channel then guarantees "everything written before me is on screen"
+                        foreach (var barrier in barriers)
+                        {
+                            barrier.TrySetResult();
+                        }
+                        barriers.Clear();
+                    }
+                    catch (Exception e)
+                    {
+                        // Fail the waiters affected by a crash mid-apply so they fall back
+                        // immediately instead of sitting out their full timeout
+                        foreach (var barrier in barriers)
+                        {
+                            barrier.TrySetException(e);
+                        }
+                        barriers.Clear();
+                        throw;
+                    }
+                    finally
+                    {
+                        _viewUpdateInProgress = false;
+                    }
                 }
 
                 if (!_disposed)
@@ -290,11 +313,6 @@ namespace Flow.Launcher.ViewModel
                 throw t.Exception;
 #else
                 App.API.LogError(ClassName, $"Error happen in task dealing with viewupdate for results. {t.Exception}");
-                // A batch may have been lost mid-apply; declare the view caught up so settle-waiters cannot
-                // hang until timeout on every subsequent Enter. Over-counting here only ends a wait early.
-                Interlocked.Exchange(ref _resultsProcessedCount, Interlocked.Read(ref _resultsWrittenCount));
-                Interlocked.Exchange(ref _resultsProcessedSignal,
-                    new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
                 _resultsViewUpdateTask =
                     Task.Run(UpdateActionAsync).ContinueWith(continueAction, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
 #endif
@@ -302,24 +320,15 @@ namespace Flow.Launcher.ViewModel
         }
 
         /// <summary>
-        /// Writes one batch of results into the view-update channel and counts it, so that
-        /// <see cref="WaitForResultsSettledAsync"/> can tell when the view has drained every
-        /// batch written so far. All channel writes must go through here: the lock makes the
-        /// counter order identical to the channel (FIFO) order.
+        /// Writes one batch of results into the view-update channel. Kept as the single entry point
+        /// for result writes so barrier ordering (see <see cref="WaitForResultsSettledAsync"/>) holds:
+        /// the channel's FIFO order is the only ordering the settle mechanism relies on.
         /// </summary>
         /// <param name="item">The batch of plugin results to publish to the results view.</param>
         /// <returns>True if the batch was accepted by the channel; false if the write failed.</returns>
         private bool TryWriteResultsForUpdate(ResultsForUpdate item)
         {
-            lock (_resultsWriteLock)
-            {
-                if (!_resultsUpdateChannelWriter.TryWrite(item))
-                {
-                    return false;
-                }
-                Interlocked.Increment(ref _resultsWrittenCount);
-                return true;
-            }
+            return _resultsUpdateChannelWriter.TryWrite(new ResultsUpdateMessage(item, null));
         }
 
         public void RegisterResultsUpdatedEvent(PluginPair pair)
@@ -610,7 +619,8 @@ namespace Flow.Launcher.ViewModel
         /// </summary>
         /// <param name="timeoutMs">Upper bound in milliseconds on the total wait, so a slow or
         /// hung plugin cannot block opening a result indefinitely.</param>
-        /// <returns>True if the view settled within the timeout; false if the timeout elapsed.</returns>
+        /// <returns>True if the view settled within the timeout; false on timeout, on a faulted
+        /// view-update loop, or during shutdown. Callers should then act on the current list as-is.</returns>
         private async Task<bool> WaitForResultsSettledAsync(int timeoutMs)
         {
             var deadline = Environment.TickCount64 + timeoutMs;
@@ -628,28 +638,44 @@ namespace Flow.Launcher.ViewModel
                 {
                     return false;
                 }
-                // The flow has completed, so all of its channel writes are counted already.
-                // Now wait for the view-update loop to catch up to that count.
-                var target = Interlocked.Read(ref _resultsWrittenCount);
-                while (Interlocked.Read(ref _resultsProcessedCount) < target)
+                // Fast path: plugin tasks write their results before completing, so once the flow
+                // task is done all of its batches are in the channel. If the channel is empty and
+                // no apply is in progress, the view is already caught up and Enter pays nothing.
+                // Load order is load-bearing: Count == 0 proves any dequeue (which fences via its
+                // interlocked ops, after the loop volatile-writes the flag) already happened, so a
+                // subsequent flag read cannot miss an in-progress apply. The explicit full fence
+                // pins that read order, which volatile acquire semantics alone would not.
+                if (_resultsUpdateChannelReader.Count == 0)
                 {
-                    // Capture the signal first, then re-check the counter: the update loop
-                    // publishes the counter before swapping the signal, so a wake-up between
-                    // these two lines is caught by the re-check and cannot be missed.
-                    var signal = Volatile.Read(ref _resultsProcessedSignal).Task;
-                    if (Interlocked.Read(ref _resultsProcessedCount) >= target)
+                    Interlocked.MemoryBarrier();
+                    if (!_viewUpdateInProgress)
                     {
-                        break;
+                        if (ReferenceEquals(_latestQueryFlowTask, flowTask))
+                        {
+                            return true;
+                        }
+                        continue; // a newer flow started while we waited; settle that one too
                     }
-                    remaining = deadline - Environment.TickCount64;
-                    if (remaining <= 0)
-                    {
-                        return false;
-                    }
-                    if (await Task.WhenAny(signal, Task.Delay((int)remaining)) != signal)
-                    {
-                        return false;
-                    }
+                }
+                // Slow path: enqueue a barrier. The channel is FIFO, so when the view-update loop
+                // resolves it, every batch written before it has been applied to the result list.
+                var barrier = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (!_resultsUpdateChannelWriter.TryWrite(new ResultsUpdateMessage(null, barrier)))
+                {
+                    return false; // channel completed: we are shutting down
+                }
+                remaining = deadline - Environment.TickCount64;
+                if (remaining <= 0)
+                {
+                    return false;
+                }
+                if (await Task.WhenAny(barrier.Task, Task.Delay((int)remaining)) != barrier.Task)
+                {
+                    return false;
+                }
+                if (!barrier.Task.IsCompletedSuccessfully)
+                {
+                    return false; // the view-update loop faulted mid-apply; act on the current list
                 }
                 // If nothing newer started while we waited, the view is settled; otherwise wait
                 // for the newer flow too (e.g. paste or a plugin-initiated query text change).
