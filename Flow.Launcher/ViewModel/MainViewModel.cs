@@ -58,6 +58,22 @@ namespace Flow.Launcher.ViewModel
         private ChannelWriter<ResultsForUpdate> _resultsUpdateChannelWriter;
         private Task _resultsViewUpdateTask;
 
+        // ---- State for making Enter wait until the result list has caught up with the query text ----
+        // Latest query flow task (covers search delay, plugin queries and their writes into the update channel).
+        private volatile Task _latestQueryFlowTask = Task.CompletedTask;
+        // Count of ResultsForUpdate batches written into the update channel. Incremented under
+        // _resultsWriteLock together with the channel write, so channel order == counter order.
+        private long _resultsWrittenCount;
+        // Count of batches the view-update loop has drained from the channel and applied (or skipped as cancelled).
+        // Invariant: _resultsProcessedCount <= _resultsWrittenCount; equality means the view is caught up.
+        private long _resultsProcessedCount;
+        private readonly object _resultsWriteLock = new();
+        // Completed and swapped by the view-update loop after every applied batch; waiters re-check the counters.
+        private TaskCompletionSource _resultsProcessedSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        // Upper bound on how long Enter may wait for in-flight queries before falling back to the current list,
+        // so a slow or hung plugin can never make Enter unresponsive.
+        private const int OpenResultSettleTimeoutMs = 1000;
+
         private readonly IReadOnlyList<Result> _emptyResult = new List<Result>();
         private readonly IReadOnlyList<DialogJumpResult> _emptyDialogJumpResult = new List<DialogJumpResult>();
 
@@ -219,6 +235,8 @@ namespace Flow.Launcher.ViewModel
             {
                 var queue = new Dictionary<string, ResultsForUpdate>();
                 var channelReader = resultUpdateChannel.Reader;
+                // Resume from the published count so a restart after a fault does not lose progress
+                var processedCount = Interlocked.Read(ref _resultsProcessedCount);
 
                 // it is not supposed to be false because it won't be complete
                 while (await channelReader.WaitToReadAsync())
@@ -226,6 +244,8 @@ namespace Flow.Launcher.ViewModel
                     await Task.Delay(20);
                     while (channelReader.TryRead(out var item))
                     {
+                        // Cancelled items count as processed too: they are consumed and will never be applied
+                        processedCount++;
                         if (!item.Token.IsCancellationRequested)
                         {
                             // Indicate if to clear existing results so to show only ones from plugins with action keywords
@@ -251,6 +271,13 @@ namespace Flow.Launcher.ViewModel
 
                     UpdateResultView(queue.Values);
                     queue.Clear();
+
+                    // Publish progress only after the batch is applied to the view, then wake settle-waiters.
+                    // Order matters: waiters capture the signal task, re-check the counter, then await,
+                    // so publishing the count first makes a missed wake-up impossible.
+                    Interlocked.Exchange(ref _resultsProcessedCount, processedCount);
+                    Interlocked.Exchange(ref _resultsProcessedSignal,
+                        new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
                 }
 
                 if (!_disposed)
@@ -263,9 +290,35 @@ namespace Flow.Launcher.ViewModel
                 throw t.Exception;
 #else
                 App.API.LogError(ClassName, $"Error happen in task dealing with viewupdate for results. {t.Exception}");
+                // A batch may have been lost mid-apply; declare the view caught up so settle-waiters cannot
+                // hang until timeout on every subsequent Enter. Over-counting here only ends a wait early.
+                Interlocked.Exchange(ref _resultsProcessedCount, Interlocked.Read(ref _resultsWrittenCount));
+                Interlocked.Exchange(ref _resultsProcessedSignal,
+                    new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
                 _resultsViewUpdateTask =
                     Task.Run(UpdateActionAsync).ContinueWith(continueAction, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
 #endif
+            }
+        }
+
+        /// <summary>
+        /// Writes one batch of results into the view-update channel and counts it, so that
+        /// <see cref="WaitForResultsSettledAsync"/> can tell when the view has drained every
+        /// batch written so far. All channel writes must go through here: the lock makes the
+        /// counter order identical to the channel (FIFO) order.
+        /// </summary>
+        /// <param name="item">The batch of plugin results to publish to the results view.</param>
+        /// <returns>True if the batch was accepted by the channel; false if the write failed.</returns>
+        private bool TryWriteResultsForUpdate(ResultsForUpdate item)
+        {
+            lock (_resultsWriteLock)
+            {
+                if (!_resultsUpdateChannelWriter.TryWrite(item))
+                {
+                    return false;
+                }
+                Interlocked.Increment(ref _resultsWrittenCount);
+                return true;
             }
         }
 
@@ -307,7 +360,7 @@ namespace Flow.Launcher.ViewModel
 
                 App.API.LogDebug(ClassName, $"Update results for plugin <{pair.Metadata.Name}>");
 
-                if (!_resultsUpdateChannelWriter.TryWrite(new ResultsForUpdate(resultsCopy, pair.Metadata, e.Query,
+                if (!TryWriteResultsForUpdate(new ResultsForUpdate(resultsCopy, pair.Metadata, e.Query,
                     token)))
                 {
                     App.API.LogError(ClassName, "Unable to add item to Result Update Queue");
@@ -550,8 +603,106 @@ namespace Flow.Launcher.ViewModel
             }
         }
 
+        /// <summary>
+        /// Waits until the result list reflects the current query text: the latest query flow
+        /// (including its search delay and all plugin queries) has finished AND every result batch
+        /// it wrote into the update channel has been drained and applied by the view-update loop.
+        /// </summary>
+        /// <param name="timeoutMs">Upper bound in milliseconds on the total wait, so a slow or
+        /// hung plugin cannot block opening a result indefinitely.</param>
+        /// <returns>True if the view settled within the timeout; false if the timeout elapsed.</returns>
+        private async Task<bool> WaitForResultsSettledAsync(int timeoutMs)
+        {
+            var deadline = Environment.TickCount64 + timeoutMs;
+            while (true)
+            {
+                var flowTask  = _latestQueryFlowTask;
+                var remaining = deadline - Environment.TickCount64;
+                if (remaining <= 0)
+                {
+                    return false;
+                }
+                // WhenAny instead of a direct await: a faulted query flow must not throw here,
+                // and Enter should then just act on whatever the view currently shows.
+                if (await Task.WhenAny(flowTask, Task.Delay((int)remaining)) != flowTask)
+                {
+                    return false;
+                }
+                // The flow has completed, so all of its channel writes are counted already.
+                // Now wait for the view-update loop to catch up to that count.
+                var target = Interlocked.Read(ref _resultsWrittenCount);
+                while (Interlocked.Read(ref _resultsProcessedCount) < target)
+                {
+                    // Capture the signal first, then re-check the counter: the update loop
+                    // publishes the counter before swapping the signal, so a wake-up between
+                    // these two lines is caught by the re-check and cannot be missed.
+                    var signal = Volatile.Read(ref _resultsProcessedSignal).Task;
+                    if (Interlocked.Read(ref _resultsProcessedCount) >= target)
+                    {
+                        break;
+                    }
+                    remaining = deadline - Environment.TickCount64;
+                    if (remaining <= 0)
+                    {
+                        return false;
+                    }
+                    if (await Task.WhenAny(signal, Task.Delay((int)remaining)) != signal)
+                    {
+                        return false;
+                    }
+                }
+                // If nothing newer started while we waited, the view is settled; otherwise wait
+                // for the newer flow too (e.g. paste or a plugin-initiated query text change).
+                if (ReferenceEquals(_latestQueryFlowTask, flowTask))
+                {
+                    return true;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Opens the currently selected result exactly like <see cref="OpenResultAsync"/>, but first
+        /// waits (bounded by <see cref="OpenResultSettleTimeoutMs"/>) for in-flight query results to
+        /// be applied to the list. Bound to the Enter key bindings so that typing fast and pressing
+        /// Enter cannot launch a result belonging to an older query text. Mouse clicks intentionally
+        /// stay on <see cref="OpenResultCommand"/>: a click targets the item that was visibly clicked,
+        /// and re-settling the list would move the target out from under the pointer.
+        /// </summary>
         [RelayCommand]
-        private async Task OpenResultAsync(string index)
+        private async Task OpenSelectedResultAsync()
+        {
+            // Capture modifiers now, at the actual Enter press, so the settle wait below cannot
+            // change which modifier combination the result's action observes.
+            var specialKeyState = GlobalHotkey.CheckModifiers();
+            // Context menu and history views are updated synchronously and never go through the
+            // result-update channel; waiting there would only add latency and could stall on an
+            // unrelated background query, so gate the wait on the query-results view.
+            if (QueryResultsSelected())
+            {
+                var settled = await WaitForResultsSettledAsync(OpenResultSettleTimeoutMs);
+                if (!settled)
+                {
+                    App.API.LogDebug(ClassName, "Query did not settle in time; opening currently selected result");
+                }
+            }
+            await OpenResultCoreAsync(null, specialKeyState);
+        }
+
+        [RelayCommand]
+        private Task OpenResultAsync(string index)
+        {
+            // not null index means pressing modifier key + number, should ignore the modifier key
+            var specialKeyState = index is not null ? SpecialKeyState.Default : GlobalHotkey.CheckModifiers();
+            return OpenResultCoreAsync(index, specialKeyState);
+        }
+
+        /// <summary>
+        /// Executes the selected (or index-addressed) result.
+        /// </summary>
+        /// <param name="index">Zero-based result index to select first, or null to use the current selection.</param>
+        /// <param name="specialKeyState">Modifier key state to pass to the result's action, captured by the
+        /// caller at the moment of user input so that waiting (settling) cannot change the observed modifiers.</param>
+        private async Task OpenResultCoreAsync(string index, SpecialKeyState specialKeyState)
         {
             // Must check query results selected before executing the action
             var queryResultsSelected = QueryResultsSelected();
@@ -599,8 +750,7 @@ namespace Flow.Launcher.ViewModel
             {
                 hideWindow = await result.ExecuteAsync(new ActionContext
                 {
-                    // not null means pressing modifier key + number, should ignore the modifier key
-                    SpecialKeyState = index is not null ? SpecialKeyState.Default : GlobalHotkey.CheckModifiers()
+                    SpecialKeyState = specialKeyState
                 }).ConfigureAwait(false);
             }
 
@@ -1534,7 +1684,24 @@ namespace Flow.Launcher.ViewModel
             _history.UpdateIcoPathAbsolute();
         }
 
-        private async Task QueryResultsAsync(bool searchDelay, bool isReQuery = false, bool reSelect = true)
+        /// <summary>
+        /// Starts a query flow and remembers it as the latest one, so that opening a result via
+        /// Enter can wait for it (see <see cref="WaitForResultsSettledAsync"/>). All query starts
+        /// go through here; the field assignment happens synchronously on the caller's (UI) thread,
+        /// so a subsequent Enter key binding always observes the flow for the final query text.
+        /// </summary>
+        /// <param name="searchDelay">Whether plugin queries should apply the configured search delay.</param>
+        /// <param name="isReQuery">Whether this is a re-query of the same query text.</param>
+        /// <param name="reSelect">Whether the first result should be re-selected when results update.</param>
+        /// <returns>The task representing the whole query flow, including channel writes.</returns>
+        private Task QueryResultsAsync(bool searchDelay, bool isReQuery = false, bool reSelect = true)
+        {
+            var task = QueryResultsCoreAsync(searchDelay, isReQuery, reSelect);
+            _latestQueryFlowTask = task;
+            return task;
+        }
+
+        private async Task QueryResultsCoreAsync(bool searchDelay, bool isReQuery, bool reSelect)
         {
             _updateSource?.Cancel();
 
@@ -1766,7 +1933,7 @@ namespace Flow.Launcher.ViewModel
 
                 App.API.LogDebug(ClassName, $"Update results for plugin <{plugin.Metadata.Name}>");
 
-                if (!_resultsUpdateChannelWriter.TryWrite(new ResultsForUpdate(resultsCopy, plugin.Metadata, query,
+                if (!TryWriteResultsForUpdate(new ResultsForUpdate(resultsCopy, plugin.Metadata, query,
                     token, reSelect)))
                 {
                     App.API.LogError(ClassName, "Unable to add item to Result Update Queue");
@@ -1782,7 +1949,7 @@ namespace Flow.Launcher.ViewModel
 
                 App.API.LogDebug(ClassName, $"Update results for history");
 
-                if (!_resultsUpdateChannelWriter.TryWrite(new ResultsForUpdate(results, _historyMetadata, query,
+                if (!TryWriteResultsForUpdate(new ResultsForUpdate(results, _historyMetadata, query,
                     token, reSelect)))
                 {
                     App.API.LogError(ClassName, "Unable to add item to Result Update Queue");

@@ -83,20 +83,20 @@
             Modifiers="Control" />
         <KeyBinding
             Key="Enter"
-            Command="{Binding OpenResultCommand}"
+            Command="{Binding OpenSelectedResultCommand}"
             Modifiers="Ctrl+Shift" />
         <KeyBinding
             Key="Enter"
             Command="{Binding ToggleContextMenuCommand}"
             Modifiers="Shift" />
-        <KeyBinding Key="Enter" Command="{Binding OpenResultCommand}" />
+        <KeyBinding Key="Enter" Command="{Binding OpenSelectedResultCommand}" />
         <KeyBinding
             Key="Enter"
-            Command="{Binding OpenResultCommand}"
+            Command="{Binding OpenSelectedResultCommand}"
             Modifiers="Ctrl" />
         <KeyBinding
             Key="Enter"
-            Command="{Binding OpenResultCommand}"
+            Command="{Binding OpenSelectedResultCommand}"
             Modifiers="Alt" />
         <KeyBinding
             Key="D1"
