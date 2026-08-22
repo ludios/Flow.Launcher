@@ -40,8 +40,11 @@ namespace Flow.Launcher.ViewModel
         private Query _lastQuery;
         private bool _previousIsHomeQuery;
         private readonly ConcurrentDictionary<Guid, Query> _progressQueryDict = new(); // Used for QueryResultAsync
-        private Query _updateQuery; // Used for ResultsUpdated
-        private long _updateQueryGeneration; // Query generation of _updateQuery, stamped onto ResultsUpdated batches
+        // Immutable snapshot of the current query flow for ResultsUpdated handlers. Query, token and
+        // generation are published as one reference so a handler cannot observe a mix of two flows,
+        // and the captured token avoids ObjectDisposedException from reading _updateSource.Token.
+        private sealed record UpdateQueryRun(Query Query, CancellationToken Token, long Generation);
+        private volatile UpdateQueryRun _updateQueryRun;
         private string _queryTextBeforeLeaveResults;
         private string _ignoredQueryText; // Used to ignore query text change when switching between context menu and query results
 
@@ -55,7 +58,6 @@ namespace Flow.Launcher.ViewModel
         private readonly UserSelectedRecord _userSelectedRecord;
 
         private CancellationTokenSource _updateSource; // Used to cancel old query flows
-        private CancellationToken _updateToken; // Used to avoid ObjectDisposedException of _updateSource.Token
 
         private ChannelWriter<ResultsUpdateMessage> _resultsUpdateChannelWriter;
         private ChannelReader<ResultsUpdateMessage> _resultsUpdateChannelReader;
@@ -344,12 +346,15 @@ namespace Flow.Launcher.ViewModel
 
             plugin.ResultsUpdated += (s, e) =>
             {
-                if (_updateQuery == null || e.Query.OriginalQuery != _updateQuery.OriginalQuery || e.Token.IsCancellationRequested)
+                // One snapshot for the whole handler: reading the flow's fields individually could
+                // mix two flows, e.g. stamp query A's batch with query B's token and generation.
+                var run = _updateQueryRun;
+                if (run == null || e.Query.OriginalQuery != run.Query.OriginalQuery || e.Token.IsCancellationRequested)
                 {
                     return;
                 }
 
-                var token = e.Token == default ? _updateToken : e.Token;
+                var token = e.Token == default ? run.Token : e.Token;
 
                 IReadOnlyList<Result> resultsCopy;
                 if (e.Results == null)
@@ -376,11 +381,8 @@ namespace Flow.Launcher.ViewModel
 
                 App.API.LogDebug(ClassName, $"Update results for plugin <{pair.Metadata.Name}>");
 
-                // The guard above ties this update to _updateQuery, so _updateQuery's generation is
-                // the right stamp (racing with a same-text re-query can at worst stamp a newer
-                // generation, which only makes Enter's staleness check more permissive).
                 if (!TryWriteResultsForUpdate(new ResultsForUpdate(resultsCopy, pair.Metadata, e.Query,
-                    token, QueryGeneration: Volatile.Read(ref _updateQueryGeneration))))
+                    token, QueryGeneration: run.Generation)))
                 {
                     App.API.LogError(ClassName, "Unable to add item to Result Update Queue");
                 }
@@ -734,6 +736,11 @@ namespace Flow.Launcher.ViewModel
                     }
                     App.API.LogDebug(ClassName,
                         "Query did not settle in time; opening selected result from the current query");
+                    // Execute the exact item that passed the check: the view-update loop is still
+                    // applying batches and may reselect meanwhile, so re-reading the selection could
+                    // execute an item this guard never validated.
+                    await OpenResultCoreAsync(null, specialKeyState, selected);
+                    return;
                 }
             }
             await OpenResultCoreAsync(null, specialKeyState);
@@ -753,7 +760,11 @@ namespace Flow.Launcher.ViewModel
         /// <param name="index">Zero-based result index to select first, or null to use the current selection.</param>
         /// <param name="specialKeyState">Modifier key state to pass to the result's action, captured by the
         /// caller at the moment of user input so that waiting (settling) cannot change the observed modifiers.</param>
-        private async Task OpenResultCoreAsync(string index, SpecialKeyState specialKeyState)
+        /// <param name="validatedItem">When not null, the exact item to execute instead of re-reading the
+        /// current selection; passed by the failed-settle Enter path so a concurrent view update cannot
+        /// swap in an item its staleness check never validated.</param>
+        private async Task OpenResultCoreAsync(string index, SpecialKeyState specialKeyState,
+            ResultViewModel validatedItem = null)
         {
             // Must check query results selected before executing the action
             var queryResultsSelected = QueryResultsSelected();
@@ -763,7 +774,7 @@ namespace Flow.Launcher.ViewModel
                 results.SelectedIndex = int.Parse(index);
             }
 
-            var result = results.SelectedItem?.Result;
+            var result = (validatedItem ?? results.SelectedItem)?.Result;
             if (result == null)
             {
                 return;
@@ -1791,13 +1802,11 @@ namespace Flow.Launcher.ViewModel
                 var currentUpdateSource = new CancellationTokenSource();
                 _updateSource = currentUpdateSource;
                 var currentCancellationToken = _updateSource.Token;
-                _updateToken = currentCancellationToken;
 
                 ProgressBarVisibility = Visibility.Hidden;
 
                 _progressQueryDict.TryAdd(updateGuid, query);
-                _updateQuery = query;
-                Volatile.Write(ref _updateQueryGeneration, queryGeneration);
+                _updateQueryRun = new UpdateQueryRun(query, currentCancellationToken, queryGeneration);
 
                 // Switch to ThreadPool thread
                 await TaskScheduler.Default;
