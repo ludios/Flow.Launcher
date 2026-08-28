@@ -71,12 +71,17 @@ namespace Flow.Launcher.ViewModel
         // Latest query flow task (covers search delay, plugin queries and their writes into the update channel).
         private volatile Task _latestQueryFlowTask = Task.CompletedTask;
         // Monotonic count of query flow starts. Each flow stamps the result batches it writes with its
-        // generation (flowing into ResultViewModel.QueryGeneration), so when the settle wait fails Enter
-        // can tell results of the current query text apart from ones lingering from an older query.
+        // generation (flowing into ResultViewModel.QueryGeneration), so Enter can tell results of the
+        // current query text apart from ones lingering from an older query: a current-gen selection
+        // ends the wait early, and after a failed settle it is the only thing Enter may open.
         private long _queryGeneration;
         // True from the moment the view-update loop wakes for a batch until that batch is applied.
         // An empty channel plus this flag being false means the view is fully caught up (Enter fast path).
         private volatile bool _viewUpdateInProgress;
+        // Completed and swapped by the view-update loop after every apply cycle. Enter's wait
+        // captures the pending Task, checks whether the selection now reflects the current query,
+        // and awaits the capture; capture-before-check makes a missed wake-up impossible.
+        private volatile TaskCompletionSource _viewAppliedPulse = new(TaskCreationOptions.RunContinuationsAsynchronously);
         // Upper bound on how long Enter may wait for in-flight queries, so a slow or hung plugin can
         // never block Enter indefinitely. After the timeout, Enter opens the selected result only if
         // it was produced by the latest query flow, and otherwise does nothing.
@@ -309,6 +314,13 @@ namespace Flow.Launcher.ViewModel
                     finally
                     {
                         _viewUpdateInProgress = false;
+                        // Wake settle-waiters to re-check the selection after every apply cycle,
+                        // faulted ones included. Publish the fresh pulse before completing the old
+                        // one, so a woken waiter always re-captures a pulse that a future cycle
+                        // will complete.
+                        var pulse = _viewAppliedPulse;
+                        _viewAppliedPulse = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                        pulse.TrySetResult();
                     }
                 }
 
@@ -330,7 +342,7 @@ namespace Flow.Launcher.ViewModel
 
         /// <summary>
         /// Writes one batch of results into the view-update channel. Kept as the single entry point
-        /// for result writes so barrier ordering (see <see cref="WaitForResultsSettledAsync"/>) holds:
+        /// for result writes so barrier ordering (see <see cref="WaitForResultsToReflectQueryAsync"/>) holds:
         /// the channel's FIFO order is the only ordering the settle mechanism relies on.
         /// </summary>
         /// <param name="item">The batch of plugin results to publish to the results view.</param>
@@ -625,16 +637,25 @@ namespace Flow.Launcher.ViewModel
         }
 
         /// <summary>
-        /// Waits until the result list reflects the current query text: the latest query flow
-        /// (including its search delay and all plugin queries) has finished AND every result batch
-        /// it wrote into the update channel has been drained and applied by the view-update loop.
+        /// Waits until the result list reflects the current query text, in the weakest sense that
+        /// makes Enter safe: the selected result carries the current query generation, i.e. the
+        /// list has initially updated for the text Enter was pressed on. Slower plugins of the
+        /// same query (e.g. an exhaustive file search) may still be running; their later batches
+        /// must not delay Enter. When no such selection appears (e.g. the query has no results),
+        /// falls back to waiting for the full settle: the latest query flow finished AND every
+        /// batch it wrote into the update channel has been applied by the view-update loop.
         /// </summary>
         /// <param name="timeoutMs">Upper bound in milliseconds on the total wait, so a slow or
         /// hung plugin cannot block opening a result indefinitely.</param>
-        /// <returns>True if the view settled within the timeout; false on timeout, on a faulted
-        /// view-update loop, or during shutdown. Callers must then treat the list as possibly stale
-        /// and only act on results stamped with the current query generation.</returns>
-        private async Task<bool> WaitForResultsSettledAsync(int timeoutMs)
+        /// <returns>
+        /// (true, item) when the selected result is from the latest query flow; callers should
+        /// open exactly <c>item</c>, because the view-update loop may reselect concurrently.
+        /// (true, null) when the flow fully settled without such a selection.
+        /// (false, null) on timeout, on a faulted view-update loop, or during shutdown; callers
+        /// must then treat the list as possibly stale and only act on results stamped with the
+        /// current query generation.
+        /// </returns>
+        private async Task<(bool Settled, ResultViewModel SelectedFromCurrentQuery)> WaitForResultsToReflectQueryAsync(int timeoutMs)
         {
             var deadline = Environment.TickCount64 + timeoutMs;
             while (true)
@@ -643,13 +664,33 @@ namespace Flow.Launcher.ViewModel
                 var remaining = deadline - Environment.TickCount64;
                 if (remaining <= 0)
                 {
-                    return false;
+                    return (false, null);
                 }
-                // WhenAny instead of a direct await: a faulted query flow must not throw here,
-                // and Enter should then just act on whatever the view currently shows.
-                if (await Task.WhenAny(flowTask, Task.Delay((int)remaining)) != flowTask)
+                // Capture the pulse before inspecting the selection: an apply cycle that lands
+                // between the check below and the await further down completes this captured
+                // pulse, so the re-check cannot be missed.
+                var pulseTask = _viewAppliedPulse.Task;
+                // Early exit: generation stamps only ever come from a flow's own batches, so a
+                // selection with the current generation proves the list has updated for the
+                // current query text, however many of its plugins are still searching. Reading
+                // the live generation (not one captured at entry) makes a query that restarts
+                // mid-wait (paste, plugin-initiated text change) settle against the newest text.
+                var selected = Results.SelectedItem;
+                if (selected?.Result != null &&
+                    selected.QueryGeneration == Interlocked.Read(ref _queryGeneration))
                 {
-                    return false;
+                    return (true, selected);
+                }
+                if (!flowTask.IsCompleted)
+                {
+                    // WhenAny instead of a direct await: a faulted query flow must not throw here,
+                    // and Enter should then just act on whatever the view currently shows.
+                    var timeoutTask = Task.Delay((int)remaining);
+                    if (await Task.WhenAny(pulseTask, flowTask, timeoutTask) == timeoutTask)
+                    {
+                        return (false, null);
+                    }
+                    continue; // an apply cycle ran or the flow finished; re-check both conditions
                 }
                 // Fast path: plugin tasks write their results before completing, so once the flow
                 // task is done all of its batches are in the channel. If the channel is empty and
@@ -665,7 +706,7 @@ namespace Flow.Launcher.ViewModel
                     {
                         if (ReferenceEquals(_latestQueryFlowTask, flowTask))
                         {
-                            return true;
+                            return (true, null);
                         }
                         continue; // a newer flow started while we waited; settle that one too
                     }
@@ -675,36 +716,38 @@ namespace Flow.Launcher.ViewModel
                 var barrier = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 if (!_resultsUpdateChannelWriter.TryWrite(new ResultsUpdateMessage(null, barrier)))
                 {
-                    return false; // channel completed: we are shutting down
+                    return (false, null); // channel completed: we are shutting down
                 }
                 remaining = deadline - Environment.TickCount64;
                 if (remaining <= 0)
                 {
-                    return false;
+                    return (false, null);
                 }
                 if (await Task.WhenAny(barrier.Task, Task.Delay((int)remaining)) != barrier.Task)
                 {
-                    return false;
+                    return (false, null);
                 }
                 if (!barrier.Task.IsCompletedSuccessfully)
                 {
-                    return false; // the view-update loop faulted mid-apply; act on the current list
+                    return (false, null); // the view-update loop faulted mid-apply; act on the current list
                 }
-                // If nothing newer started while we waited, the view is settled; otherwise wait
-                // for the newer flow too (e.g. paste or a plugin-initiated query text change).
+                // If nothing newer started while we waited, the view is settled; otherwise loop:
+                // the top-of-loop checks handle both the early exit and the newer flow.
                 if (ReferenceEquals(_latestQueryFlowTask, flowTask))
                 {
-                    return true;
+                    return (true, null);
                 }
             }
         }
 
         /// <summary>
         /// Opens the currently selected result exactly like <see cref="OpenResultAsync"/>, but first
-        /// waits (bounded by <see cref="OpenResultSettleTimeoutMs"/>) for in-flight query results to
-        /// be applied to the list. Bound to the Enter key bindings so that typing fast and pressing
-        /// Enter cannot launch a result belonging to an older query text. Mouse clicks intentionally
-        /// stay on <see cref="OpenResultCommand"/>: a click targets the item that was visibly clicked,
+        /// waits (bounded by <see cref="OpenResultSettleTimeoutMs"/>) for the result list to reflect
+        /// the current query text. Bound to the Enter key bindings so that typing fast and pressing
+        /// Enter cannot launch a result belonging to an older query text. The wait ends as soon as
+        /// the list has initially updated for the query; plugins of the same query that are still
+        /// searching do not delay Enter. Mouse clicks intentionally stay on
+        /// <see cref="OpenResultCommand"/>: a click targets the item that was visibly clicked,
         /// and re-settling the list would move the target out from under the pointer.
         /// </summary>
         [RelayCommand]
@@ -718,7 +761,15 @@ namespace Flow.Launcher.ViewModel
             // unrelated background query, so gate the wait on the query-results view.
             if (QueryResultsSelected())
             {
-                var settled = await WaitForResultsSettledAsync(OpenResultSettleTimeoutMs);
+                var (settled, selectedFromCurrentQuery) = await WaitForResultsToReflectQueryAsync(OpenResultSettleTimeoutMs);
+                if (selectedFromCurrentQuery != null)
+                {
+                    // Execute the exact item the wait validated: batches from the query's slower
+                    // plugins may still be applied concurrently and could reselect, so re-reading
+                    // the selection could execute an item the user never saw.
+                    await OpenResultCoreAsync(null, specialKeyState, selectedFromCurrentQuery);
+                    return;
+                }
                 if (!settled)
                 {
                     // The list may still contain results from an older query text (plugins that have
@@ -761,8 +812,9 @@ namespace Flow.Launcher.ViewModel
         /// <param name="specialKeyState">Modifier key state to pass to the result's action, captured by the
         /// caller at the moment of user input so that waiting (settling) cannot change the observed modifiers.</param>
         /// <param name="validatedItem">When not null, the exact item to execute instead of re-reading the
-        /// current selection; passed by the failed-settle Enter path so a concurrent view update cannot
-        /// swap in an item its staleness check never validated.</param>
+        /// current selection; passed by the Enter paths that validated a specific item (initial list
+        /// update, failed settle) so a concurrent view update cannot swap in an item the staleness
+        /// check never validated.</param>
         private async Task OpenResultCoreAsync(string index, SpecialKeyState specialKeyState,
             ResultViewModel validatedItem = null)
         {
@@ -1748,7 +1800,7 @@ namespace Flow.Launcher.ViewModel
 
         /// <summary>
         /// Starts a query flow and remembers it as the latest one, so that opening a result via
-        /// Enter can wait for it (see <see cref="WaitForResultsSettledAsync"/>). All query starts
+        /// Enter can wait for it (see <see cref="WaitForResultsToReflectQueryAsync"/>). All query starts
         /// go through here; the field assignment happens synchronously on the caller's (UI) thread,
         /// so a subsequent Enter key binding always observes the flow for the final query text.
         /// </summary>
