@@ -1,4 +1,5 @@
-﻿using System;
+﻿// Model-output: Claude Fable 5.1
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -142,13 +143,16 @@ namespace Flow.Launcher.Plugin.Explorer.Search
 
 
             var actions = activeActionKeywords.Keys.ToList();
+            var excludedExtensions = Settings.ExcludedFileExtensions();
             //Merge Quick Access Link results for non-path searches.
             results.UnionWith(GetQuickAccessResultsFilteredByActionKeyword(query, actions));
             try
             {
+                // Everything is asked to leave excluded files and folders out of its (capped) results already;
+                // this pass enforces the exclusions for the Windows index and backstops anything Everything let through.
                 await foreach (var search in searchResults.WithCancellation(token).ConfigureAwait(false))
                 {
-                    if (search.Type == ResultType.File && IsExcludedFile(search))
+                    if (search.Type == ResultType.File && IsExcludedFile(search, excludedExtensions))
                         continue;
 
                     if (IsResultTypeFilteredByActionKeyword(search.Type, actions))
@@ -289,15 +293,16 @@ namespace Flow.Launcher.Plugin.Explorer.Search
                    && WindowsIndex.WindowsIndex.PathIsIndexed(pathToDirectory);
         }
 
-        private bool IsExcludedFile(SearchResult result)
+        /// <param name="result">A file result.</param>
+        /// <param name="excludedExtensions">Extensions without dots, as from <see cref="Settings.ExcludedFileExtensions"/>.</param>
+        private static bool IsExcludedFile(SearchResult result, List<string> excludedExtensions)
         {
             if (string.IsNullOrEmpty(result.FullPath))
                 return false;
 
-            string[] excludedFileTypes = Settings.ExcludedFileTypes.Split([','], StringSplitOptions.RemoveEmptyEntries);
-            string fileExtension = Path.GetExtension(result.FullPath).TrimStart('.');
+            var fileExtension = Path.GetExtension(result.FullPath).TrimStart('.');
 
-            return excludedFileTypes.Contains(fileExtension, StringComparer.OrdinalIgnoreCase);
+            return excludedExtensions.Contains(fileExtension, StringComparer.OrdinalIgnoreCase);
         }
 
         private List<Result> GetQuickAccessResultsFilteredByActionKeyword(Query query, List<ActionKeyword> actions)

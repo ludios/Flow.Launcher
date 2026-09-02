@@ -1,6 +1,8 @@
-﻿using System;
+﻿// Model-output: Claude Fable 5.1
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -21,6 +23,14 @@ namespace Flow.Launcher.Plugin.Explorer.Search.Everything
             Settings = settings;
         }
 
+        /// <summary>
+        /// The folders the user excluded from index searches, as plain paths.
+        /// </summary>
+        private List<string> ExcludedPaths()
+        {
+            return Settings.IndexSearchExcludedSubdirectoryPaths.Select(x => x.Path).ToList();
+        }
+
         public async IAsyncEnumerable<SearchResult> SearchAsync(string search, [EnumeratorCancellation] CancellationToken token)
         {
             await EnsureAvailableAsync(token);
@@ -32,7 +42,9 @@ namespace Flow.Launcher.Plugin.Explorer.Search.Everything
                 Settings.SortOption,
                 MaxCount: Settings.MaxResult,
                 IsFullPathSearch: Settings.EverythingSearchFullPath,
-                IsRunCounterEnabled: Settings.EverythingEnableRunCount);
+                IsRunCounterEnabled: Settings.EverythingEnableRunCount,
+                ExcludedExtensions: Settings.ExcludedFileExtensions(),
+                ExcludedPaths: ExcludedPaths());
 
             await foreach (var result in api.SearchAsync(option, token))
                 yield return result;
@@ -65,7 +77,9 @@ namespace Flow.Launcher.Plugin.Explorer.Search.Everything
                 ContentSearchKeyword: contentSearch,
                 MaxCount: Settings.MaxResult,
                 IsFullPathSearch: Settings.EverythingSearchFullPath,
-                IsRunCounterEnabled: Settings.EverythingEnableRunCount);
+                IsRunCounterEnabled: Settings.EverythingEnableRunCount,
+                ExcludedExtensions: Settings.ExcludedFileExtensions(),
+                ExcludedPaths: ExcludedPaths());
 
             await foreach (var result in api.SearchAsync(option, token))
             {

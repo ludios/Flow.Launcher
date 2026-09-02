@@ -1,7 +1,9 @@
-﻿using Flow.Launcher.Plugin;
+﻿// Model-output: Claude Fable 5.1
+using Flow.Launcher.Plugin;
 using Flow.Launcher.Plugin.Explorer;
 using Flow.Launcher.Plugin.Explorer.Search;
 using Flow.Launcher.Plugin.Explorer.Search.DirectoryInfo;
+using Flow.Launcher.Plugin.Explorer.Search.Everything;
 using Flow.Launcher.Plugin.Explorer.Search.WindowsIndex;
 using Flow.Launcher.Plugin.SharedCommands;
 using NUnit.Framework;
@@ -24,6 +26,69 @@ namespace Flow.Launcher.Test.Plugins
         private bool PreviousLocationExistsReturnsTrue(string dummyString) => true;
 
         private bool PreviousLocationNotExistReturnsFalse(string dummyString) => false;
+
+        [TestCase("ogg,flac", new[] { "ogg", "flac" })]
+        [TestCase(" ogg , .flac ,,", new[] { "ogg", "flac" })]
+        [TestCase("", new string[0])]
+        public void GivenExcludedFileTypesSetting_WhenParsed_ThenEntriesAreBareExtensions(string setting, string[] expected)
+        {
+            var settings = new Settings { ExcludedFileTypes = setting };
+
+            ClassicAssert.AreEqual(expected, settings.ExcludedFileExtensions());
+        }
+
+        [TestCase("zclank", new string[0], new string[0], "zclank")]
+        [TestCase("zclank", new[] { "ogg", "flac" }, new string[0], "zclank !ext:ogg;flac")]
+        [TestCase("zclank", new string[0], new[] { @"C:\Users\at\code", @"D:\Backups\" }, @"zclank !""C:\Users\at\code\"" !""D:\Backups\""")]
+        [TestCase("zclank|xclank", new[] { "png" }, new[] { @"C:\Some Folder" }, @"zclank|xclank !ext:png !""C:\Some Folder\""")]
+        [TestCase("zclank", new[] { "js", "a b", "x;y", "" }, new[] { "", @"C:\has""quote" }, "zclank !ext:js")]
+        [TestCase("zclank", new string[0], new[] { "C:/Users/at/code/" }, @"zclank !""C:\Users\at\code\""")]
+        public void GivenEverythingSearch_WhenExclusionsConfigured_ThenSearchTextCarriesThemAsTerms(
+            string keyword, string[] excludedExtensions, string[] excludedPaths, string expectedSearchText)
+        {
+            var option = new EverythingSearchOption(keyword, EverythingSortOption.NAME_ASCENDING,
+                ExcludedExtensions: excludedExtensions, ExcludedPaths: excludedPaths);
+
+            var query = EverythingHelper.PrepareQuery(option);
+
+            ClassicAssert.AreEqual(expectedSearchText, query.SearchText);
+            ClassicAssert.IsFalse(query.Option.UseRegex);
+        }
+
+        [Test]
+        public void GivenEverythingSearch_WhenNoExclusionsGiven_ThenSearchTextIsTheKeyword()
+        {
+            var option = new EverythingSearchOption("zclank", EverythingSortOption.NAME_ASCENDING);
+
+            var query = EverythingHelper.PrepareQuery(option);
+
+            ClassicAssert.AreEqual("zclank", query.SearchText);
+            ClassicAssert.IsFalse(query.Option.UseRegex);
+        }
+
+        [Test]
+        public void GivenEverythingDirectoryAndContentSearch_WhenExclusionsConfigured_ThenExclusionTermsComeLast()
+        {
+            var option = new EverythingSearchOption("foo", EverythingSortOption.NAME_ASCENDING,
+                IsContentSearch: true, ContentSearchKeyword: "bar", ParentPath: @"C:\x", IsRecursive: false,
+                ExcludedExtensions: new[] { "png" });
+
+            var query = EverythingHelper.PrepareQuery(option);
+
+            ClassicAssert.AreEqual(@"foo parent:""C:\x"" content:""bar"" !ext:png", query.SearchText);
+        }
+
+        [Test]
+        public void GivenEverythingRegexSearch_WhenExclusionsConfigured_ThenSearchTextIsTheBarePattern()
+        {
+            var option = new EverythingSearchOption("@^zclank.*", EverythingSortOption.NAME_ASCENDING,
+                ExcludedExtensions: new[] { "png" }, ExcludedPaths: new[] { @"C:\Users\at\code" });
+
+            var query = EverythingHelper.PrepareQuery(option);
+
+            ClassicAssert.AreEqual("^zclank.*", query.SearchText);
+            ClassicAssert.IsTrue(query.Option.UseRegex);
+        }
 
         [SupportedOSPlatform("windows7.0")]
         [TestCase("C:\\SomeFolder\\", "directory='file:C:\\SomeFolder\\'")]

@@ -1,7 +1,9 @@
-﻿using System;
+﻿// Model-output: Claude Fable 5.1
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Linq;
 using System.Text.Json.Serialization;
 using Flow.Launcher.Plugin.Explorer.Search;
 using Flow.Launcher.Plugin.Explorer.Search.Everything;
@@ -26,6 +28,19 @@ namespace Flow.Launcher.Plugin.Explorer
         public string ShellPath { get; set; } = "cmd";
 
         public string ExcludedFileTypes { get; set; } = "";
+
+        /// <summary>
+        /// The extensions listed in <see cref="ExcludedFileTypes"/>, each without a leading dot or surrounding
+        /// whitespace, so that "ogg, .flac" and "ogg,flac" mean the same thing.
+        /// </summary>
+        public List<string> ExcludedFileExtensions()
+        {
+            return ExcludedFileTypes
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(x => x.TrimStart('.'))
+                .Where(x => x.Length > 0)
+                .ToList();
+        }
 
         public bool UseLocationAsWorkingDir { get; set; } = false;
 
