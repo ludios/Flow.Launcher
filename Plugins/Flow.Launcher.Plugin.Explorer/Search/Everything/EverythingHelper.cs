@@ -41,7 +41,10 @@ namespace Flow.Launcher.Plugin.Explorer.Search.Everything
             }
 
             var builder = new StringBuilder();
-            builder.Append(keyword);
+            // Everything evaluates '|' before AND by default, but that order is configurable; grouping an OR keyword
+            // keeps the ANDed terms below applying to all of its branches either way.
+            var groupOr = !option.UseRegex && keyword?.Contains('|') == true;
+            builder.Append(groupOr ? $"<{keyword}>" : keyword);
 
             if (!string.IsNullOrWhiteSpace(option.ParentPath))
             {
@@ -62,10 +65,9 @@ namespace Flow.Launcher.Plugin.Explorer.Search.Everything
         }
 
         /// <summary>
-        /// Appends one "!ext:a;b" term and one !"path\" term per folder. Everything ANDs space-separated terms and
-        /// evaluates '|' before AND, so the terms apply to the whole keyword even when it contains an OR. Entries that
-        /// cannot be written safely in Everything's syntax are skipped; the caller's own post-filter still catches
-        /// them, just without protection from the result cap.
+        /// Appends one "!ext:a;b" term and one !"path\" term per folder; Everything ANDs space-separated terms.
+        /// Entries that cannot be written safely in Everything's syntax are skipped; the caller's own post-filter
+        /// still catches them, just without protection from the result cap.
         /// </summary>
         /// <param name="builder">The search text so far; receives the new terms.</param>
         /// <param name="excludedExtensions">Extensions without dots, or null.</param>

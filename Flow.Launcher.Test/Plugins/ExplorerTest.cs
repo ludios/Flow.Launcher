@@ -40,7 +40,7 @@ namespace Flow.Launcher.Test.Plugins
         [TestCase("zclank", new string[0], new string[0], "zclank")]
         [TestCase("zclank", new[] { "ogg", "flac" }, new string[0], "zclank !ext:ogg;flac")]
         [TestCase("zclank", new string[0], new[] { @"C:\Users\at\code", @"D:\Backups\" }, @"zclank !""C:\Users\at\code\"" !""D:\Backups\""")]
-        [TestCase("zclank|xclank", new[] { "png" }, new[] { @"C:\Some Folder" }, @"zclank|xclank !ext:png !""C:\Some Folder\""")]
+        [TestCase("zclank|xclank", new[] { "png" }, new[] { @"C:\Some Folder" }, @"<zclank|xclank> !ext:png !""C:\Some Folder\""")]
         [TestCase("zclank", new[] { "js", "a b", "x;y", "" }, new[] { "", @"C:\has""quote" }, "zclank !ext:js")]
         [TestCase("zclank", new string[0], new[] { "C:/Users/at/code/" }, @"zclank !""C:\Users\at\code\""")]
         public void GivenEverythingSearch_WhenExclusionsConfigured_ThenSearchTextCarriesThemAsTerms(
